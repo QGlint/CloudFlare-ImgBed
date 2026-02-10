@@ -1,3 +1,5 @@
+import { resolveMimeType } from '../utils/mimeType.js';
+
 /* ======== 文件读取工具函数 ======== */
 
 // 判断请求域名是否在允许的域名列表中
@@ -48,6 +50,18 @@ export function isFromPublicBrowse(Referer, origin) {
     return false;
 }
 
+function decodeFileNameForMime(encodedFileName) {
+    if (typeof encodedFileName !== 'string') {
+        return '';
+    }
+
+    try {
+        return decodeURIComponent(encodedFileName);
+    } catch (_error) {
+        return encodedFileName;
+    }
+}
+
 // 公共响应头设置函数
 export function setCommonHeaders(headers, encodedFileName, fileType, Referer, url) {
     headers.set('Content-Disposition', `inline; filename="${encodedFileName}"; filename*=UTF-8''${encodedFileName}`);
@@ -55,8 +69,10 @@ export function setCommonHeaders(headers, encodedFileName, fileType, Referer, ur
     headers.set('Accept-Ranges', 'bytes');
     headers.set('Vary', 'Range');
 
-    if (fileType) {
-        headers.set('Content-Type', fileType);
+    const decodedFileName = decodeFileNameForMime(encodedFileName);
+    const resolvedFileType = resolveMimeType(fileType, decodedFileName);
+    if (resolvedFileType) {
+        headers.set('Content-Type', resolvedFileType);
     }
 
     // 根据Referer设置CDN缓存策略（排除公开图库页面的请求）

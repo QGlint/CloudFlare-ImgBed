@@ -83,6 +83,7 @@
 
 - 必填：`file`
 - 可选：`sha256`（给 HuggingFace 用，减少服务端计算）
+- `Content-Type` 兜底：服务端会按 `file.type` -> 文件扩展名 自动推断；仅在无法推断时回落 `application/octet-stream`
 
 常用 query 参数：
 
@@ -173,6 +174,10 @@
 }
 ```
 
+说明：
+
+- `files[].mimeType` 可选；未传时服务端会优先从 `contentBase64` 的 data URL 前缀推断，其次按文件名扩展名推断，最后兜底 `application/octet-stream`
+
 返回体：
 
 ```json
@@ -198,6 +203,7 @@
 - `requestId` 幂等（同请求号重复调用返回首次结果）
 - 支持中文文件名（返回 `src` 已 URL 编码）
 - 每个文件仍单独写 metadata，兼容 `/file/<path>`
+- `/file` 读取时会对缺失/无效 MIME 按文件名扩展名做兜底，降低浏览器误下载概率
 
 错误码：
 

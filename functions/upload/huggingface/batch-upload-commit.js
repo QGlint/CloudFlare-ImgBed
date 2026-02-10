@@ -1,6 +1,7 @@
 import { HuggingFaceAPI } from '../../utils/huggingfaceAPI.js';
 import { fetchUploadConfig, fetchSecurityConfig } from '../../utils/sysConfig.js';
 import { getDatabase } from '../../utils/databaseAdapter.js';
+import { resolveMimeType } from '../../utils/mimeType.js';
 import {
     endUpload,
     getUploadIp,
@@ -92,11 +93,10 @@ function normalizeFileName(name) {
     return trimmed;
 }
 
-function normalizeMimeType(mimeType) {
-    if (typeof mimeType !== 'string' || !mimeType.trim()) {
-        return 'application/octet-stream';
-    }
-    return mimeType.trim();
+function normalizeMimeType(mimeType, fileName, contentBase64) {
+    return resolveMimeType(mimeType, fileName, {
+        dataUrlValue: contentBase64
+    });
 }
 
 function normalizeContentBase64(contentBase64) {
@@ -352,7 +352,7 @@ export async function onRequestPost(context) {
         for (let i = 0; i < files.length; i++) {
             const fileInput = files[i] || {};
             const fileName = normalizeFileName(fileInput.name);
-            const mimeType = normalizeMimeType(fileInput.mimeType);
+            const mimeType = normalizeMimeType(fileInput.mimeType, fileName, fileInput.contentBase64);
             const base64Data = normalizeContentBase64(fileInput.contentBase64);
             const estimatedSize = estimateBase64Size(base64Data);
 

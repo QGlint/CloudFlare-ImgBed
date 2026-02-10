@@ -555,8 +555,7 @@ export class HuggingFaceAPI {
     /**
      * 直接提交文件（非 LFS，用于小文本文件）
      */
-    async commitDirectFile(filePath, file, commitMessage) {
-<<<<<<< HEAD
+ async commitDirectFile(filePath, file, commitMessage) {
         const url = `${this.baseURL}/api/datasets/${this.repo}/commit/main`;
         
         const bytes = new Uint8Array(await file.arrayBuffer());
@@ -579,19 +578,30 @@ export class HuggingFaceAPI {
                 value: { summary: commitMessage }
             }),
             JSON.stringify({
-=======
-        const content = await this.blobToBase64(file);
-        return await this.commitOperations([
-            {
->>>>>>> 8e455fb (feat(huggingface): add batch upload commit API and docs)
                 key: 'file',
                 value: {
                     path: filePath,
                     content: content,
                     encoding: 'base64'
                 }
-            }
-        ], commitMessage);
+            })
+        ].join('\n');
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${this.token}`,
+                'Content-Type': 'application/x-ndjson'
+            },
+            body
+        });
+
+        if (!response.ok) {
+            const error = await response.text();
+            throw new Error(`Direct commit failed: ${response.status} - ${error}`);
+        }
+
+        return await response.json();
     }
 
     /**

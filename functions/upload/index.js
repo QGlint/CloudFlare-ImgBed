@@ -10,6 +10,7 @@ import { handleChunkMerge } from "./chunkMerge";
 import { TelegramAPI } from "../utils/telegramAPI";
 import { DiscordAPI } from "../utils/discordAPI";
 import { HuggingFaceAPI } from "../utils/huggingfaceAPI";
+import { resolveMimeType } from "../utils/mimeType.js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
 
@@ -129,14 +130,18 @@ async function processFileUpload(context, formdata = null) {
     // 获取文件信息
     const time = new Date().getTime();
     const file = formdata.get('file');
-    const fileType = file.type;
+    if (!file) {
+        return createResponse('Error: file is required', { status: 400 });
+    }
+
     let fileName = file.name;
+    const fileType = resolveMimeType(file.type, fileName);
     const fileSizeBytes = file.size; // 文件大小，单位字节
     const fileSize = (fileSizeBytes / 1024 / 1024).toFixed(2); // 文件大小，单位MB
 
-    // 检查fileType和fileName是否存在
-    if (fileType === null || fileType === undefined || fileName === null || fileName === undefined) {
-        return createResponse('Error: fileType or fileName is wrong, check the integrity of this file!', { status: 400 });
+    // 检查 fileName 是否存在
+    if (fileName === null || fileName === undefined || fileName === '') {
+        return createResponse('Error: fileName is wrong, check the integrity of this file!', { status: 400 });
     }
 
     // 提取图片尺寸
@@ -280,8 +285,13 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
 
     const R2DataBase = env.img_r2;
 
-    // 写入R2数据库
-    await R2DataBase.put(fullId, formdata.get('file'));
+    // 写入R2数据库（写入 httpMetadata 以确保后续读取可返回正确 Content-Type）
+    const r2PutOptions = {
+        httpMetadata: {
+            contentType: metadata.FileType || 'application/octet-stream'
+        }
+    };
+    await R2DataBase.put(fullId, formdata.get('file'), r2PutOptions);
 
     // 更新metadata
     metadata.Channel = "CloudflareR2";
@@ -371,7 +381,7 @@ async function uploadFileToS3(context, fullId, metadata, returnLink) {
             Bucket: bucketName,
             Key: s3FileName,
             Body: uint8Array, // 直接使用 Blob
-            ContentType: file.type
+            ContentType: metadata.FileType || file.type || 'application/octet-stream'
         };
 
         // 执行上传
