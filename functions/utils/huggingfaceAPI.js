@@ -20,6 +20,45 @@ export class HuggingFaceAPI {
         this.baseURL = 'https://huggingface.co';
     }
 
+    buildRequestError(message, status = null, detail = null, extra = {}) {
+        const fullMessage = status
+            ? `${message}: ${status}${detail ? ` - ${detail}` : ''}`
+            : `${message}${detail ? ` - ${detail}` : ''}`;
+        const error = new Error(fullMessage);
+        if (status !== null && status !== undefined) {
+            error.status = status;
+        }
+        if (detail !== null && detail !== undefined) {
+            error.detail = detail;
+        }
+        Object.assign(error, extra);
+        return error;
+    }
+
+    uint8ArrayToBase64(uint8Array) {
+        if (!(uint8Array instanceof Uint8Array)) {
+            throw new Error('uint8ArrayToBase64 expects Uint8Array');
+        }
+
+        const chunkSize = 0x8000;
+        let binary = '';
+        for (let i = 0; i < uint8Array.length; i += chunkSize) {
+            const chunk = uint8Array.subarray(i, i + chunkSize);
+            binary += String.fromCharCode(...chunk);
+        }
+        return btoa(binary);
+    }
+
+    async blobToBase64(blob) {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        return this.uint8ArrayToBase64(bytes);
+    }
+
+    async getBlobSampleBase64(blob, sampleSize = 512) {
+        const sampleBytes = new Uint8Array(await blob.slice(0, sampleSize).arrayBuffer());
+        return this.uint8ArrayToBase64(sampleBytes);
+    }
+
     /**
      * 计算文件的 SHA256 哈希（仅在未提供预计算哈希时使用）
      * @param {Blob} blob 
@@ -107,7 +146,7 @@ export class HuggingFaceAPI {
 
         if (!response.ok) {
             const error = await response.text();
-            throw new Error(`Preupload failed: ${response.status} - ${error}`);
+            throw this.buildRequestError('Preupload failed', response.status, error);
         }
 
         return await response.json();
@@ -137,7 +176,7 @@ export class HuggingFaceAPI {
 
         if (!response.ok) {
             const error = await response.text();
-            throw new Error(`LFS batch failed: ${response.status} - ${error}`);
+            throw this.buildRequestError('LFS batch failed', response.status, error);
         }
 
         return await response.json();
@@ -167,7 +206,7 @@ export class HuggingFaceAPI {
 
         if (!response.ok) {
             const error = await response.text();
-            throw new Error(`LFS upload failed: ${response.status} - ${error}`);
+            throw this.buildRequestError('LFS upload failed', response.status, error);
         }
 
         return true;
@@ -202,7 +241,7 @@ export class HuggingFaceAPI {
             });
 
             if (!response.ok) {
-                throw new Error(`Failed to upload part ${part}: ${response.status}`);
+                throw this.buildRequestError(`Failed to upload part ${part}`, response.status);
             }
 
             const etag = response.headers.get('ETag');
@@ -229,33 +268,25 @@ export class HuggingFaceAPI {
 
         if (!completeResponse.ok) {
             const error = await completeResponse.text();
-            throw new Error(`Multipart complete failed: ${completeResponse.status} - ${error}`);
+            throw this.buildRequestError('Multipart complete failed', completeResponse.status, error);
         }
 
         return true;
     }
 
-    /**
-     * 步骤4: 提交 LFS 文件引用
-     */
-    async commitLfsFile(filePath, oid, fileSize, commitMessage) {
+    async commitOperations(operations, commitMessage = 'Commit files') {
         const url = `${this.baseURL}/api/datasets/${this.repo}/commit/main`;
-        
-        // NDJSON 格式
+
+        if (!Array.isArray(operations) || operations.length === 0) {
+            throw new Error('No commit operations provided');
+        }
+
         const body = [
             JSON.stringify({
                 key: 'header',
                 value: { summary: commitMessage }
             }),
-            JSON.stringify({
-                key: 'lfsFile',
-                value: {
-                    path: filePath,
-                    algo: 'sha256',
-                    size: fileSize,
-                    oid: oid
-                }
-            })
+            ...operations.map((operation) => JSON.stringify(operation))
         ].join('\n');
 
         const response = await fetch(url, {
@@ -268,11 +299,158 @@ export class HuggingFaceAPI {
         });
 
         if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`Commit failed: ${response.status} - ${error}`);
+            const detail = await response.text();
+            const retryAfterHeader = response.headers.get('retry-after');
+            const retryAfterSeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : null;
+            throw this.buildRequestError('Commit failed', response.status, detail, {
+                retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : null
+            });
         }
 
         return await response.json();
+    }
+
+    /**
+     * 步骤4: 提交 LFS 文件引用
+     */
+    async commitLfsFile(filePath, oid, fileSize, commitMessage) {
+        return await this.commitOperations([
+            {
+                key: 'lfsFile',
+                value: {
+                    path: filePath,
+                    algo: 'sha256',
+                    size: fileSize,
+                    oid: oid
+                }
+            }
+        ], commitMessage);
+    }
+
+    async prepareUploadOperation(file, filePath, options = {}) {
+        const { precomputedSha256 = null, contentBase64 = null } = options;
+
+        // 1. 获取文件样本（前512字节的base64）
+        const sample = await this.getBlobSampleBase64(file, 512);
+
+        // 2. Preupload 检查
+        console.log('Preupload check...');
+        const preuploadResult = await this.preupload(filePath, file.size, sample);
+        console.log('Preupload result:', JSON.stringify(preuploadResult));
+
+        const fileInfo = preuploadResult.files?.[0];
+        const needsLfs = fileInfo?.uploadMode === 'lfs';
+        console.log('Needs LFS:', needsLfs);
+
+        if (needsLfs) {
+            // 3. 计算 SHA256
+            let oid;
+            if (precomputedSha256) {
+                console.log('Using precomputed SHA256:', precomputedSha256);
+                oid = precomputedSha256;
+            } else {
+                console.log('Computing SHA256 on server (may timeout for large files)...');
+                oid = await this.sha256(file);
+                console.log('SHA256:', oid);
+            }
+
+            // 4. LFS Batch - 获取上传 URL
+            console.log('LFS batch request...');
+            const batchResult = await this.lfsBatch(oid, file.size);
+            console.log('LFS batch result:', JSON.stringify(batchResult));
+
+            const obj = batchResult.objects?.[0];
+            if (obj?.error) {
+                throw new Error(`LFS error: ${obj.error.message}`);
+            }
+
+            // 5. 上传到 LFS 存储（如果需要）
+            if (obj?.actions?.upload) {
+                console.log('Uploading to LFS storage...');
+                await this.uploadToLFS(obj.actions.upload, file, oid);
+                console.log('LFS upload complete');
+            } else {
+                console.log('File already exists in LFS');
+            }
+
+            return {
+                oid,
+                fileSize: file.size,
+                needsLfs: true,
+                operation: {
+                    key: 'lfsFile',
+                    value: {
+                        path: filePath,
+                        algo: 'sha256',
+                        size: file.size,
+                        oid
+                    }
+                }
+            };
+        }
+
+        const encodedContent = contentBase64 || await this.blobToBase64(file);
+        return {
+            oid: null,
+            fileSize: file.size,
+            needsLfs: false,
+            operation: {
+                key: 'file',
+                value: {
+                    path: filePath,
+                    content: encodedContent,
+                    encoding: 'base64'
+                }
+            }
+        };
+    }
+
+    async uploadFilesInSingleCommit(files, commitMessage = 'Batch upload files') {
+        if (!Array.isArray(files) || files.length === 0) {
+            throw new Error('files must be a non-empty array');
+        }
+
+        if (!await this.createRepoIfNotExists()) {
+            throw new Error('Failed to create or access repository');
+        }
+
+        const operations = [];
+        const uploadedFiles = [];
+
+        for (const fileItem of files) {
+            const { file, filePath, precomputedSha256 = null, contentBase64 = null, name = '' } = fileItem;
+            if (!file || !filePath) {
+                throw new Error('Invalid file item: file and filePath are required');
+            }
+
+            const prepared = await this.prepareUploadOperation(file, filePath, {
+                precomputedSha256,
+                contentBase64
+            });
+
+            operations.push(prepared.operation);
+            uploadedFiles.push({
+                name,
+                filePath,
+                fileSize: prepared.fileSize,
+                oid: prepared.oid,
+                needsLfs: prepared.needsLfs,
+                fileUrl: this.getFileURL(filePath)
+            });
+        }
+
+        try {
+            const commitResult = await this.commitOperations(operations, commitMessage);
+            return {
+                success: true,
+                commitResult,
+                files: uploadedFiles
+            };
+        } catch (error) {
+            error.stage = error.stage || 'commit';
+            error.uploadedFiles = uploadedFiles;
+            throw error;
+        }
     }
 
     /**
@@ -351,59 +529,13 @@ export class HuggingFaceAPI {
             console.log('Path:', filePath);
             console.log('Size:', file.size);
 
-            // 1. 使用预计算的 SHA256 或在后端计算
-            let oid;
-            if (precomputedSha256) {
-                console.log('Using precomputed SHA256:', precomputedSha256);
-                oid = precomputedSha256;
-            } else {
-                console.log('Computing SHA256 on server (may timeout for large files)...');
-                oid = await this.sha256(file);
-                console.log('SHA256:', oid);
-            }
+            const prepared = await this.prepareUploadOperation(file, filePath, {
+                precomputedSha256
+            });
 
-            // 2. 获取文件样本（前512字节的base64）
-            const sampleBytes = new Uint8Array(await file.slice(0, 512).arrayBuffer());
-            const sample = btoa(String.fromCharCode(...sampleBytes));
-
-            // 3. Preupload 检查
-            console.log('Preupload check...');
-            const preuploadResult = await this.preupload(filePath, file.size, sample);
-            console.log('Preupload result:', JSON.stringify(preuploadResult));
-
-            const fileInfo = preuploadResult.files?.[0];
-            const needsLfs = fileInfo?.uploadMode === 'lfs';
-            console.log('Needs LFS:', needsLfs);
-
-            if (needsLfs) {
-                // 4. LFS Batch - 获取上传 URL
-                console.log('LFS batch request...');
-                const batchResult = await this.lfsBatch(oid, file.size);
-                console.log('LFS batch result:', JSON.stringify(batchResult));
-
-                const obj = batchResult.objects?.[0];
-                if (obj?.error) {
-                    throw new Error(`LFS error: ${obj.error.message}`);
-                }
-
-                // 5. 上传到 LFS 存储（如果需要）
-                if (obj?.actions?.upload) {
-                    console.log('Uploading to LFS storage...');
-                    await this.uploadToLFS(obj.actions.upload, file, oid);
-                    console.log('LFS upload complete');
-                } else {
-                    console.log('File already exists in LFS');
-                }
-
-                // 6. 提交 LFS 文件引用
-                console.log('Committing LFS file...');
-                const commitResult = await this.commitLfsFile(filePath, oid, file.size, commitMessage);
-                console.log('Commit result:', JSON.stringify(commitResult));
-            } else {
-                // 非 LFS 文件：直接 base64 提交（小文本文件）
-                console.log('Direct commit (non-LFS)...');
-                await this.commitDirectFile(filePath, file, commitMessage);
-            }
+            console.log('Committing file...');
+            const commitResult = await this.commitOperations([prepared.operation], commitMessage);
+            console.log('Commit result:', JSON.stringify(commitResult));
 
             const fileUrl = `${this.baseURL}/datasets/${this.repo}/resolve/main/${filePath}`;
             return {
@@ -411,7 +543,7 @@ export class HuggingFaceAPI {
                 filePath,
                 fileUrl,
                 fileSize: file.size,
-                oid
+                oid: prepared.oid
             };
 
         } catch (error) {
@@ -424,6 +556,7 @@ export class HuggingFaceAPI {
      * 直接提交文件（非 LFS，用于小文本文件）
      */
     async commitDirectFile(filePath, file, commitMessage) {
+<<<<<<< HEAD
         const url = `${this.baseURL}/api/datasets/${this.repo}/commit/main`;
         
         const bytes = new Uint8Array(await file.arrayBuffer());
@@ -446,30 +579,19 @@ export class HuggingFaceAPI {
                 value: { summary: commitMessage }
             }),
             JSON.stringify({
+=======
+        const content = await this.blobToBase64(file);
+        return await this.commitOperations([
+            {
+>>>>>>> 8e455fb (feat(huggingface): add batch upload commit API and docs)
                 key: 'file',
                 value: {
                     path: filePath,
                     content: content,
                     encoding: 'base64'
                 }
-            })
-        ].join('\n');
-
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${this.token}`,
-                'Content-Type': 'application/x-ndjson'
-            },
-            body
-        });
-
-        if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`Direct commit failed: ${response.status} - ${error}`);
-        }
-
-        return await response.json();
+            }
+        ], commitMessage);
     }
 
     /**
