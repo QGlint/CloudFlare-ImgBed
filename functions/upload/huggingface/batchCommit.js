@@ -55,6 +55,13 @@ const DEFAULT_MAX_FILES = 50;
 const DEFAULT_MAX_TOTAL_SIZE = 80 * 1024 * 1024;
 const DEFAULT_MAX_SINGLE_FILE_SIZE = 20 * 1024 * 1024;
 
+// 幂等键与批次记录的前缀。
+// 刻意**不使用** `manage@` 前缀：上游 functions/api/manage/batch/settings.js 会把
+// 所有 `manage@` 开头的键当作「系统设置」导出到备份中（仅排除 index*/session@*），
+// 我们的键若放在该前缀下会污染备份、并随每次上传持续膨胀。
+const IDEMPOTENCY_PREFIX = 'hfBatch@request@';
+const BATCH_RECORD_PREFIX = 'hfBatch@manifest@';
+
 function jsonResponse(data, status = 200) {
     return new Response(JSON.stringify(data), {
         status,
@@ -294,7 +301,7 @@ export async function onRequestPost(context) {
 
         // ---- 幂等：同一 requestId 直接返回首次结果 ----
         const db = getDatabase(env);
-        const idempotencyKey = requestId ? `manage@hf_batch_request@${requestId}` : null;
+        const idempotencyKey = requestId ? `${IDEMPOTENCY_PREFIX}${requestId}` : null;
         if (idempotencyKey) {
             const existing = await db.get(idempotencyKey);
             if (existing) {
@@ -509,6 +516,7 @@ export async function onRequestPost(context) {
         const payload = {
             success: true,
             requestId: requestId || null,
+            batchId: null,
             folder: normalizedFolder || null,
             commitId: extractCommitId(uploadResult.commitResult),
             channelName: hfChannel.name || null,
@@ -516,6 +524,36 @@ export async function onRequestPost(context) {
             count: responseFiles.length,
             files: responseFiles
         };
+
+        // ---- 写入批次清单（manifest）----
+        // 目的：让「一次上传」成为一个可回溯、可列出、可整批操作的单元。
+        // 这是解决「云端布局乱、事后难以核对某一批」的关键记录。
+        // 与幂等键共用独立前缀，不污染上游的 manage@ 设置导出。
+        try {
+            const batchId = requestId ? `req_${requestId}` : `b_${now}_${Math.random().toString(36).slice(2, 8)}`;
+            const manifest = {
+                batchId,
+                folder: normalizedFolder || '',
+                channelName: hfChannel.name || null,
+                repo: hfChannel.repo,
+                commitId: payload.commitId,
+                createdAt: now,
+                fileCount: responseFiles.length,
+                totalBytes: preparedFiles.reduce((sum, file) => sum + (file.metadata.FileSizeBytes || 0), 0),
+                files: preparedFiles.map(file => ({
+                    fullId: file.fullId,
+                    name: file.name,
+                    size: file.metadata.FileSizeBytes || 0,
+                    mimeType: file.mimeType
+                }))
+            };
+
+            await db.put(`${BATCH_RECORD_PREFIX}${batchId}`, JSON.stringify(manifest));
+            payload.batchId = batchId;
+        } catch (manifestError) {
+            // 清单写入失败不应让整次上传失败——文件已经上传成功。
+            console.warn('写入批次清单失败:', manifestError.message);
+        }
 
         if (idempotencyKey) {
             await db.put(idempotencyKey, JSON.stringify(payload));

@@ -215,7 +215,10 @@ export class HuggingFaceBatchAPI extends HuggingFaceAPI {
         }
 
         try {
-            const commitResult = await this.commitOperations(operations, commitMessage);
+            // 用带重试与降级的提交：HF 对 commit 请求设 60 秒超时，
+            // 且会返回 429 限流。官方 huggingface_hub 的做法是
+            // 「超时/失败就缩小批量再试」，这里采用同样策略。
+            const commitResult = await this.commitOperationsWithBackoff(operations, commitMessage);
             return {
                 success: true,
                 commitResult,
@@ -227,5 +230,91 @@ export class HuggingFaceBatchAPI extends HuggingFaceAPI {
             error.uploadedFiles = uploadedFiles;
             throw error;
         }
+    }
+
+    /**
+     * 带退避与降级拆分的提交
+     *
+     * 依据（HF 官方）：
+     *  - commit 请求有 60 秒超时（docs/hub/storage-limits）
+     *  - 限流返回 429，带 Retry-After
+     *  - 官方 huggingface_hub 的做法：提交失败就「缩小批量 + 拆分 + 重试」
+     *    （issue #4331，目标单次 commit 耗时 <40 秒）
+     *
+     * 策略：
+     *  1. 429 / 5xx / 超时 → 按 Retry-After 或指数退避等待后重试
+     *  2. 重试仍失败且操作数 >1 → 把操作拆成两半分别提交（降低单请求耗时）
+     *
+     * @returns {Promise<Object>} 与 commitOperations 相同的返回结构
+     */
+    async commitOperationsWithBackoff(operations, commitMessage, options = {}) {
+        const {
+            maxRetries = 3,
+            baseDelayMs = 1000,
+            maxDelayMs = 30000
+        } = options;
+
+        if (!Array.isArray(operations) || operations.length === 0) {
+            throw new Error('No commit operations provided');
+        }
+
+        let lastError = null;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await this.commitOperations(operations, commitMessage);
+            } catch (error) {
+                lastError = error;
+
+                const status = error?.status;
+                // 仅对「可重试」的错误做退避：限流与网关类错误
+                const retryable = status === 429 || (status >= 500 && status < 600) || status === undefined;
+
+                if (!retryable || attempt === maxRetries) {
+                    break;
+                }
+
+                // 优先使用服务端给的 Retry-After
+                let delayMs = Number.isFinite(error?.retryAfterSeconds)
+                    ? error.retryAfterSeconds * 1000
+                    : baseDelayMs * Math.pow(2, attempt);
+                delayMs = Math.min(delayMs, maxDelayMs);
+
+                console.warn(
+                    `HF commit 第 ${attempt + 1} 次失败（status=${status}），${delayMs}ms 后重试`
+                );
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+        }
+
+        // 退避重试仍未成功：若操作数 >1，拆成两半分别提交，
+        // 以降低「单次 commit 耗时」，规避 60 秒超时。
+        if (operations.length > 1) {
+            const mid = Math.ceil(operations.length / 2);
+            console.warn(
+                `HF commit 持续失败，将 ${operations.length} 个操作拆分为 ` +
+                `${mid} + ${operations.length - mid} 分批提交`
+            );
+
+            const first = await this.commitOperationsWithBackoff(
+                operations.slice(0, mid),
+                `${commitMessage} (part 1)`,
+                { maxRetries, baseDelayMs, maxDelayMs }
+            );
+            const second = await this.commitOperationsWithBackoff(
+                operations.slice(mid),
+                `${commitMessage} (part 2)`,
+                { maxRetries, baseDelayMs, maxDelayMs }
+            );
+
+            // 两次提交都成功：返回后一次的结果（commitId 取后者）
+            return {
+                ...second,
+                splitCommits: 2,
+                firstCommitResult: first
+            };
+        }
+
+        throw lastError;
     }
 }

@@ -34,10 +34,29 @@
 | `functions/utils/batchUpload/batchFolder.js` | **批次文件夹规则**：用户指定文件夹名 + 路径安全校验 |
 | `functions/utils/batchUpload/huggingfaceBatchAPI.js` | HF 批量提交能力（继承上游类，一次 commit 传多文件） |
 | `functions/upload/huggingface/batchCommit.js` | **批量上传 API 路由**（`POST /upload/huggingface/batchCommit`） |
+| `functions/api/manage/hfBatchList.js` | **批次清单查询**（`GET /api/manage/hfBatchList`） |
 | `test/batchFolder.test.mjs` | 批次文件夹与路径安全的单元测试 |
+| `test/huggingfaceBatch.test.mjs` | 批量提交逻辑与 NDJSON 组装测试 |
+| `test/batchCommit.e2e.mjs` | 端到端流程测试 |
+| `test/batchManifest.test.mjs` | 批次清单与键前缀安全测试 |
+| `test/indexLoadAnalysis.mjs` | 索引操作压力分析（设计参考，非断言测试） |
 
 > 设计要点：`huggingfaceBatchAPI.js` 用**继承**而不是改上游类的源码。
 > 这样 `functions/utils/storage/huggingfaceAPI.js` 一行都没被改过，上游怎么重构它都不会产生冲突。
+
+### 自定义的 KV 键前缀（不属于上游命名空间）
+
+| 前缀 | 用途 |
+| --- | --- |
+| `hfBatch@request@<requestId>` | 批量上传的幂等键 |
+| `hfBatch@manifest@<batchId>` | 批次清单，记录每批包含哪些文件 |
+
+**为什么不用 `manage@` 前缀**：上游 `functions/api/manage/batch/settings.js`
+会把所有 `manage@` 开头的键当作「系统设置」导出到备份中（仅排除 `index*` 与 `session@*`）。
+若把自定义键放进该前缀，会让每次批量上传都往备份里塞一条无用记录。
+`test/batchManifest.test.mjs` 对此有反向验证（确认旧前缀确实会被导出）。
+
+> 设计取舍与后续可选项见 [docs/CUSTOMIZATION-DESIGN.md](docs/CUSTOMIZATION-DESIGN.md)。
 
 ---
 
