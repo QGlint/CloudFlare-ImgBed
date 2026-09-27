@@ -2,6 +2,80 @@
 
 > **这份文档解决一个问题：以后从上游更新代码时，怎样保证自定义功能不丢、不冲突。**
 
+## 零、分支策略与远程配置（先读这一节）
+
+### 远程
+
+| 远程 | 地址 | 权限 |
+| --- | --- | --- |
+| `origin` | `https://github.com/QGlint/CloudFlare-ImgBed.git`（你自己的 fork） | 可读写，推送用这个 |
+| `upstream` | `https://github.com/MarSeventh/CloudFlare-ImgBed.git`（官方仓库） | **只读**（push 地址已被改为 `DISABLED_do_not_push`，防止误推官方） |
+
+### 分支
+
+| 分支 | 定位 | 说明 |
+| --- | --- | --- |
+| `main` | **上游基线** | 保持与上游一致，**不要往这里放自定义功能** |
+| `dev` | **你的功能分支** | 所有自定义改动都在这里；`main` 是它的直接祖先 |
+| `batch` | 历史备份 | 旧 `dev` 的内容，迁移来源，确认无误前保留 |
+
+### 为什么这样分
+
+- `main` 是"上游走到哪了"的**锚点**。删掉或污染它，就没法回答"我落后上游多少"。
+- `dev` 完全包含 `main`（纯快进关系），所以 `dev` 既能用上游代码，又带着你的功能。
+- 自定义改动**全部集中在新增文件**里，因此上游更新时不会和它们冲突。
+
+---
+
+## 零之二、日常同步流程（照抄即可）
+
+```bash
+# 1. 看看上游有没有新东西
+git fetch upstream main
+git log --oneline main..upstream/main        # 落后了哪些提交
+
+# 2. 把上游更新并进你的功能分支
+git checkout dev
+git merge upstream/main                      # 预期零冲突；有冲突看下面的排查
+
+# 3. 必须验证自定义功能还在（这一步不要跳过）
+node test/batchFolder.test.mjs
+node test/huggingfaceBatch.test.mjs
+node test/commitBackoff.test.mjs
+node test/batchManifest.test.mjs
+node test/batchCommit.e2e.mjs
+node test/directoryTree.e2e.mjs
+node deploy/worker/generate-routes.js
+grep -n "batchCommit\|hfBatchList" deploy/worker/index.js   # 应看到两条路由
+
+# 4. 推送你的功能分支
+git push origin dev
+
+# 5. （可选）让 main 也跟上上游
+git checkout main
+git merge --ff-only upstream/main
+git push origin main
+```
+
+> **第 3 步是唯一能立刻发现"功能被合并抹掉"的检查。** 全套应输出
+> 6 个套件共 **121 项断言全部通过**。
+>
+> 如果 `git merge upstream/main` 报冲突：说明本次上游改动碰到了你改过的文件。
+> 按本文第五节「依赖接口」排查，**优先保留你的自定义文件、接受上游对上游文件的修改**。
+
+### 当前状态（便于对照）
+
+```
+upstream/main  ─┐
+                ├─→ main (ce481fd8, 上游基线)
+                │      └─→ dev (b6a82991, + 3 个自定义提交, 3308 行纯新增)
+```
+
+`dev` 相对 `main` 只有新增，**0 行删除**。这是刻意的：只要保持"纯新增"，
+上游怎么改都不会与你的功能冲突。
+
+---
+
 ## 一、为什么以前会「合并把内容丢完」
 
 本仓库经历过一次严重事故：从上游同步时，`dev` 分支的自定义内容被清空。原因不是操作失误，而是**分支分叉太深**：
