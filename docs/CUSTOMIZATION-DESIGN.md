@@ -1,5 +1,35 @@
 # 定制化功能设计评估
 
+## 零之前：这个需求的真正目的是「GUI 目录树清晰」
+
+> **重要澄清**：此项定制**不是**为了"事后回溯"（manifest 那种用途），
+> 而是因为**网页图床 GUI 的目录树显示很乱**，需要真正的文件夹结构。
+
+**机制（已从源码确认的完整链路）**：
+
+```
+上传时写入 metadata.Directory = "<批次名>/"
+  → functions/utils/indexManager.js:2178  getDirectoryTree() 读取 metadata.Directory
+  → functions/utils/indexManager.js:1732  buildTree() 按 '/' 逐级构建父子节点
+  → functions/api/directoryTree.js        GET /api/directoryTree 返回树
+  → GUI 渲染文件夹
+```
+
+**关键结论**：目录树**完全由 `metadata.Directory` 派生**。
+只要上传时该字段写对，GUI 就会显示为文件夹。
+`test/directoryTree.e2e.mjs` 用 18 项断言验证了这条链路，其中
+**场景 1 精确复现了问题**：逐张上传（`Directory` 为空）时，根目录下
+**一个文件夹都没有**（`collectDirectories` 返回 `[]`）——这正是"乱"的根源。
+
+**因此本项目的核心交付是**：让 `uploadFolder` 参数可被程序化调用方指定，
+使每次批量上传天然形成一个文件夹，且**同名文件在不同批次间不再冲突**
+（测试场景 2：两篇论文都有 `fig1.png`，归入不同文件夹后互不覆盖）。
+
+manifest 与批次清单（下文第三节）是**附加能力**，用于管理端按批查看，
+不是本需求的主目标。
+
+---
+
 > **本文回答一个问题：基于 HF 的真实限制、管理图片的实际需求和上游的现有机制，
 > 我们的批量上传还需要补哪些定制化功能？**
 >
